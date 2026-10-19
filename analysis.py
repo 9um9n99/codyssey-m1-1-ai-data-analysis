@@ -60,6 +60,9 @@ EVENTS = [
 ]
 SWEEP_HALF_WIDTH = 6        # 기준 기온을 정점일 기온 중앙값 기준 위아래 몇 도까지 바꿔볼지
 MIN_VALID_YEARS = 6         # 기준 기온 하나를 평가할 때 필요한 최소 연도 수
+PERM_B = 3000               # 순열 검정 반복 횟수
+PERM_SEED = 0               # 순열 검정 난수 시드(재현용)
+SMOOTH_CHECK = (3, 7, 14)   # 정점일 찾을 때 이동평균 길이 민감도 점검
 
 # 그래프 색 (dataviz 스킬의 검증된 팔레트 앞 3칸: 세 색 모두 서로 구분되는 것을 확인함)
 COLORS = {"반팔": "#eb6834", "겉옷": "#1baf7a", "패딩": "#2a78d6"}
@@ -242,6 +245,61 @@ def evaluate_threshold(peaks_ev, temp7, ev, threshold):
     return out, d
 
 
+def trigger_matrix(peaks_ev, temp7, ev, thresholds):
+    """해(행) x 기준 기온(열) 표: 기온이 기준에 처음 닿은 날(연중 일수). 모든 해에 값이 있는 기준만 남긴다."""
+    pe = peaks_ev.sort_values("year").reset_index(drop=True)
+    cols = {}
+    for t in thresholds:
+        _, d = evaluate_threshold(pe, temp7, ev, t)
+        cols[t] = d.set_index("year")["trigger_doy"]
+    mat = pd.DataFrame(cols).reindex(pe["year"]).dropna(axis=1)
+    return pe["peak_doy"].to_numpy(float), mat
+
+
+def loo_errors(peak, trig):
+    """한 해씩 빼고 맞힌 평균 오차 (달력, 날씨) - loo_mae 와 같은 계산을 한 번에 처리"""
+    n = len(peak)
+    lag = peak - trig
+    mean_lag = (lag.sum() - lag) / (n - 1)
+    err_wx = np.abs(peak - (trig + mean_lag))
+    err_cal = np.abs(peak - (peak.sum() - peak) / (n - 1))
+    return float(err_cal.mean()), float(err_wx.mean())
+
+
+def nested_validation(peak, mat):
+    """공정한 비교: 기준 기온도 '빼 놓은 해를 제외한 해'에서만 골라서 그 해를 맞혀 본다.
+    (기준을 전체 해에서 고르면 정답을 보고 고른 셈이라 날씨 모델이 유리해진다)"""
+    n, k = len(peak), mat.shape[1]
+    trig = mat.to_numpy(float)
+    err_cal, err_wx, chosen = [], [], []
+    for i in range(n):
+        tr = np.arange(n) != i
+        train_err = []
+        for j in range(k):
+            lag = peak[tr] - trig[tr, j]
+            train_err.append(np.abs(peak[tr] - (trig[tr, j] + lag.mean())).mean())
+        j = int(np.argmin(train_err))
+        lag = peak[tr] - trig[tr, j]
+        err_wx.append(abs(peak[i] - (trig[i, j] + lag.mean())))
+        err_cal.append(abs(peak[i] - peak[tr].mean()))
+        chosen.append(int(mat.columns[j]))
+    return float(np.mean(err_cal)), float(np.mean(err_wx)), chosen
+
+
+def permutation_test(peak, mat, n_iter=PERM_B, seed=PERM_SEED):
+    """우연일 확률: 해마다 검색 정점일을 무작위로 섞어도(날씨와 무관해도),
+    모든 기준 중 가장 좋은 기준에서 지금만큼 좋은(오차비가 낮은) 결과가 나올 확률"""
+    trig = mat.to_numpy(float)
+
+    def best_ratio(pv):
+        return min(loo_errors(pv, trig[:, j])[1] / loo_errors(pv, trig[:, j])[0] for j in range(trig.shape[1]))
+
+    observed = best_ratio(peak)
+    rng = np.random.default_rng(seed)
+    hits = sum(best_ratio(rng.permutation(peak)) <= observed for _ in range(n_iter))
+    return observed, (hits + 1) / (n_iter + 1)
+
+
 # ----------------------------------------------------------------------------
 # 5. Q5: 겉옷 관심의 시작·종료와 기온으로 본 계절 길이
 # ----------------------------------------------------------------------------
@@ -410,36 +468,39 @@ def fig_peaks(peaks):
     save(fig, "03_peak_dates_and_temps.png")
 
 
-def fig_weather_vs_calendar(detail, best_detail, bests):
-    """Q3 핵심 그래프: 정점일을 맞히는 오차 (달력 vs 날씨)"""
+def fig_weather_vs_calendar(detail, best_detail, bests, robust):
+    """Q3 핵심 그래프: 정점일을 맞히는 오차 (달력 vs 날씨). 기준 기온을 훈련 해에서 고르는 공정한 값을 강조"""
     from matplotlib.patches import Patch
-    fig, ax = plt.subplots(figsize=(11, 6))
+    fig, ax = plt.subplots(figsize=(11.5, 6.4))
     w = 0.26
     x = np.arange(len(EVENTS))
     ymax = 0
     for i, ev in enumerate(EVENTS):
         col = COLORS[ev["col"]]
-        info = detail[ev["name"]][0]
+        rb = robust[ev["name"]]
         binfo = best_detail[ev["name"]][0]
-        vals = [info["mae_calendar"], info["mae_weather"], binfo["mae_weather"]]
-        styles = [dict(color="#b9b8b3"), dict(color=col, alpha=0.4), dict(color=col)]
+        vals = [rb["nested_cal"], binfo["mae_weather"], rb["nested_wx"]]
+        styles = [dict(color="#b9b8b3"), dict(color=col, alpha=0.35), dict(color=col)]
         for k, (v, st) in enumerate(zip(vals, styles)):
             ax.bar(i + (k - 1) * w, v, width=w * 0.92, zorder=3, **st)
-            ax.text(i + (k - 1) * w, v + 0.3, f"{v:.1f}", ha="center", va="bottom", fontsize=10, color=INK)
+            ax.text(i + (k - 1) * w, v + 0.3, f"{v:.1f}", ha="center", va="bottom", fontsize=10, color=INK,
+                    fontweight="bold" if k == 2 else "normal")
         ymax = max(ymax, max(vals))
     ax.set_xticks(x)
-    ax.set_xticklabels([f"{ev['name']}\n(최적 기준 {bests[ev['name']]}도)" for ev in EVENTS], fontsize=11)
+    ax.set_xticklabels([f"{ev['name']}\n우연일 확률 p={robust[ev['name']]['p']:.3f}\n(전체에서 고른 최적 기준 {bests[ev['name']]}도)"
+                        for ev in EVENTS], fontsize=10.5)
     ax.set_ylabel("정점일 예측 오차 (일, 낮을수록 정확)")
-    ax.set_ylim(0, ymax * 1.18)
+    ax.set_ylim(0, ymax * 1.32)
     ax.grid(axis="x", visible=False)
     ax.legend(handles=[Patch(color="#b9b8b3", label="달력으로 예측 (해마다 평균 날짜)"),
-                       Patch(color=INK_2, alpha=0.4, label="날씨로 예측 (기준 = 그날의 기온 중앙값)"),
-                       Patch(color=INK_2, label="날씨로 예측 (기준 = 가장 잘 맞은 기온)")],
-              loc="upper right", fontsize=10)
-    headline(fig, "Q3. 기준 기온을 잘 잡으면 날씨가 달력보다 정점일을 더 잘 맞혀요",
-             "한 해를 빼놓고 나머지 해로 그 해 정점일을 맞혀 본 평균 오차예요. 달력 = '매년 같은 날짜'라고 가정, 날씨 = '기온이 기준에 닿은 날 + 평균 시차'로 예측.\n"
-             "단, 기준을 정점일 기온 그대로 쓰면(연한 막대) 겉옷 봄을 빼고는 달력이 낫고, '가장 잘 맞은 기준'은 13개 중 고른 값이라 낙관적이에요.")
-    fig.tight_layout(rect=[0, 0, 1, 0.87])
+                       Patch(color=INK_2, alpha=0.35, label="날씨로 예측: 전체 해에서 고른 최적 기준 (정답을 보고 고른 값이라 낙관적)"),
+                       Patch(color=INK_2, label="날씨로 예측: 기준도 훈련 해에서 고름 (공정한 비교)")],
+              loc="upper right", fontsize=9.5)
+    headline(fig, "Q3. 공정하게 비교하면 날씨가 달력을 뚜렷하게 이기는 건 패딩뿐이에요",
+             "한 해를 빼놓고 나머지 해로 그 해의 정점일을 맞혀 본 평균 오차예요. 가장 믿을 만한 비교는 회색과 진한 색 막대예요(연한 막대는 참고용).\n"
+             "p = 날씨와 무관해도 기준 13개 중 이만큼 좋은 기준이 나올 확률(순열 검정 3,000회)이에요. 낮을수록 우연일 가능성이 적어요.\n"
+             "겉옷(봄)은 최적 기준에선 날씨가 이겼지만 기준을 해마다 새로 고르면 달력보다 나빠져요. 즉 그 결과는 불안정해요.")
+    fig.tight_layout(rect=[0, 0, 1, 0.84])
     save(fig, "04_weather_vs_calendar.png")
 
 
@@ -468,9 +529,10 @@ def fig_year_by_year(best_detail, bests):
         ax.set_title(f"{ev['name']}  (기준 {bests[ev['name']]}도)\n정점이 평균 {abs(lag):.1f}일 {word}, 상관 r={info['r']:.2f}", fontsize=11)
         if ev is EVENTS[0]:
             ax.legend(loc="lower left", fontsize=8.5, bbox_to_anchor=(0.0, -0.2), ncol=1)
-    headline(fig, "Q4. 대체로 기온이 기준에 닿은 뒤 며칠 안에 검색이 정점을 찍어요 (패딩은 약 9일 뒤)",
+    headline(fig, "Q4. 날씨 연동이 가장 뚜렷한 패딩은 기온이 10도 아래로 내려간 뒤 며칠 안에 정점을 찍어요",
              "해마다 한 줄이에요. 빈 동그라미 = 기온이 기준에 처음 닿은 날, 색 동그라미 = 검색이 가장 많았던 날. 색 동그라미가 오른쪽이면 날씨가 바뀐 '뒤'에 반응한 거예요.\n"
-             "줄 길이가 해마다 비슷하고 두 동그라미가 같이 움직이면(상관 r이 클수록) 날씨를 따라간 거예요. 기준 기온은 그래프 4에서 가장 잘 맞은 값이에요.")
+             "줄 길이가 해마다 비슷하고 두 동그라미가 같이 움직이면(상관 r이 클수록) 날씨를 따라간 거예요. 기준 기온은 전체 해에서 고른 최적값이라 낙관적이고,\n"
+             "공정한 검증(그래프 4)을 통과한 건 패딩뿐이에요. 패딩의 평균 시차도 이동평균 길이에 따라 +1~+9일로 움직이고, 반팔·겉옷의 시차는 참고용이에요.")
     fig.tight_layout(rect=[0, 0.02, 1, 0.84])
     save(fig, "05_year_by_year.png")
 
@@ -657,6 +719,50 @@ def main():
         pe = peaks[peaks["event"] == ev["name"]].sort_values("year")
         best_detail[ev["name"]] = evaluate_threshold(pe, temp7, ev, bests[ev["name"]])
 
+    # ---- Q3 검증 보강: 공정한 비교(중첩 검증), 우연 확률(순열 검정), 이동평균 길이 민감도
+    say("")
+    say("[검증 보강 1] 기준 기온까지 훈련 해에서 고르는 공정한 비교 + 우연일 확률(순열 검정)")
+    say("  - 공정한 비교: 빼 놓은 해를 제외한 해에서만 기준 기온을 골라 그 해의 정점일을 맞힘")
+    say(f"  - 우연일 확률 p: 정점일을 무작위로 섞어도 모든 기준 중 최고가 지금만큼 좋을 확률 ({PERM_B}회 반복)")
+    robust, rob_rows = {}, []
+    for ev in EVENTS:
+        pe = peaks[peaks["event"] == ev["name"]].sort_values("year")
+        thr = range(tstar[ev["name"]] - SWEEP_HALF_WIDTH, tstar[ev["name"]] + SWEEP_HALF_WIDTH + 1)
+        pk, mat = trigger_matrix(pe, temp7, ev, thr)
+        n_cal, n_wx, chosen = nested_validation(pk, mat)
+        obs, pval = permutation_test(pk, mat)
+        picks = pd.Series(chosen).value_counts()
+        robust[ev["name"]] = dict(nested_cal=n_cal, nested_wx=n_wx, ratio=n_wx / n_cal, p=pval, observed=obs,
+                                  n_thresholds=mat.shape[1], chosen=chosen)
+        say(f"  {ev['name']}: 오차 달력 {n_cal:.1f}일 vs 날씨(공정) {n_wx:.1f}일 (비 {n_wx / n_cal:.2f}), "
+            f"우연일 확률 p={pval:.3f}, 해마다 고른 기준 {({int(k): int(v) for k, v in picks.sort_index().items()})}")
+        rob_rows.append(dict(event=ev["name"], n_years=len(pk), n_thresholds=mat.shape[1],
+                             mae_calendar=round(n_cal, 2), mae_weather_nested=round(n_wx, 2),
+                             ratio_nested=round(n_wx / n_cal, 3), best_ratio_in_sample=round(obs, 3),
+                             p_permutation=round(pval, 4), chosen_thresholds=" ".join(map(str, chosen))))
+    pd.DataFrame(rob_rows).to_csv(OUT_DIR / "q3_robustness.csv", index=False, encoding="utf-8-sig")
+    say("  (비 < 1 이면 날씨가 유리, > 1 이면 달력이 유리. 기준 후보의 중심을 전체 해의 정점일 기온 중앙값으로 잡은 점은 약한 정보 누수예요)")
+
+    say("")
+    say("[검증 보강 2] 정점일을 찾는 이동평균 길이를 바꿔도 결론이 유지될까? (가장 잘 맞은 기준 기준)")
+    sm_rows = []
+    for w in SMOOTH_CHECK:
+        pkw = find_peaks(smooth(cleaned, w), temp7, last_day)
+        for ev in EVENTS:
+            pe = pkw[pkw["event"] == ev["name"]].sort_values("year")
+            ts = int(round(pe["peak_temp"].median()))
+            best = None
+            for t in range(ts - SWEEP_HALF_WIDTH, ts + SWEEP_HALF_WIDTH + 1):
+                o, _ = evaluate_threshold(pe, temp7, ev, t)
+                if np.isfinite(o["ratio"]) and (best is None or o["ratio"] < best["ratio"]):
+                    best = o
+            sm_rows.append(dict(smooth_days=w, event=ev["name"], median_peak=md_label(pe["peak_doy"].median()),
+                                median_peak_temp=round(pe["peak_temp"].median(), 1), best_threshold=best["threshold"],
+                                r=round(best["r"], 2), mean_lag=round(best["mean_lag"], 1), ratio=round(best["ratio"], 2)))
+    smdf = pd.DataFrame(sm_rows)
+    smdf.to_csv(OUT_DIR / "robustness_smoothing.csv", index=False, encoding="utf-8-sig")
+    say(smdf.to_string(index=False))
+
     # ---- Q5
     say("")
     say("=" * 70)
@@ -717,7 +823,7 @@ def main():
     fig_overview(cleaned, sm)
     fig_monthly(normalized, y0, y1)
     fig_peaks(peaks)
-    fig_weather_vs_calendar(detail, best_detail, bests)
+    fig_weather_vs_calendar(detail, best_detail, bests, robust)
     fig_year_by_year(best_detail, bests)
     fig_sweep(sweeps, tstar, bests)
     fig_seasons(seasons)
