@@ -4,7 +4,7 @@ Codyssey 'AI 데이터 분석: 데이터 기반 트렌드 분석' 미션
 
 실행 방법:  python analysis.py
 만들어지는 것:
-    images/   그래프 PNG 6개
+    images/   그래프 PNG 9개
     outputs/  표(CSV)와 summary.txt (리포트에 옮겨 적을 숫자가 모여 있음)
 
 분석 질문 (REPORT.md 와 같은 번호)
@@ -13,6 +13,7 @@ Codyssey 'AI 데이터 분석: 데이터 기반 트렌드 분석' 미션
     Q3. 더위·추위가 일찍/늦게 온 해에는 검색 시기도 따라 움직였을까? (날씨 vs 달력)
     Q4. 사람들은 날씨가 바뀐 뒤에 살까, 바뀌기 전에 미리 살까?
     Q5. 해마다 겉옷 관심이 시작·종료되는 날과 기온으로 본 계절 길이는 어떻게 변했을까?
+    Q6. (활용) 패딩만 날씨와 연동된다면, 올해 패딩은 언제 가장 붐빌까?
 
 사용한 시계열 기법: 이동평균, 월별 집계, 구간별 통계(정점일 기온),
                     변화율(연평균 전년 대비), 시차·상관 분석
@@ -406,6 +407,95 @@ def headline(fig, title, sub=None):
     fig.text(0.01, 0.985, title, ha="left", va="top", fontsize=14, fontweight="bold", color=INK)
     if sub:
         fig.text(0.01, 0.985 - 0.055, sub, ha="left", va="top", fontsize=10, color=INK_2, linespacing=1.5)
+
+
+# ----------------------------------------------------------------------------
+# Q6. 올해 패딩 타이밍: 기온이 기준에 닿은 날을 0으로 맞춰 본 검색 흐름 + 올해 시나리오
+# ----------------------------------------------------------------------------
+def padding_event_study(sm, d, half=40):
+    """해마다 '기온이 기준에 닿은 날'을 0으로 맞추고, 그 해 정점 대비 검색 비율(0~1)을 나란히 놓는다."""
+    cols = {}
+    for _, r in d.iterrows():
+        c = pd.Timestamp(r["trigger_date"])
+        year = int(r["year"])
+        top = sm["패딩"].loc[pd.Timestamp(year, 9, 1):pd.Timestamp(year, 12, 31)].max()
+        seg = sm["패딩"].loc[c - pd.Timedelta(days=half):c + pd.Timedelta(days=half)] / top
+        seg.index = (seg.index - c).days
+        cols[year] = seg
+    return pd.DataFrame(cols)
+
+
+def fig_event_study(es, marks):
+    """Q6 근거 그래프: 기온이 10도 아래로 내려간 날을 0으로 맞추면 패딩 검색이 어떻게 오르는가"""
+    fig, ax = plt.subplots(figsize=(11, 6.2))
+    col = COLORS["패딩"]
+    for y in es.columns:
+        ax.plot(es.index, es[y], color=INK_2, lw=1, alpha=0.35)
+    mean = es.mean(axis=1)
+    ax.plot(mean.index, mean.values, color=col, lw=3, label="9년 평균", zorder=4)
+    ax.axvline(0, color=INK, lw=1.2, ls=(0, (4, 3)))
+    ax.text(-1.0, 1.15, "기온이 10도 아래로 처음 내려간 날 (0일)", fontsize=9.5, color=INK, va="top", ha="right")
+    ax.axhline(0.5, color=GRID, lw=1)
+    for key, label, dy in [("half", "정점의 절반", 0.0), ("p80", "정점의 80%", 0.1)]:
+        x = marks[key]
+        y = mean.loc[x]
+        ax.scatter([x], [y], s=90, color=col, edgecolor=SURFACE, linewidth=1.5, zorder=5)
+        ax.annotate(f"{label}: {x:+d}일", (x, y), xytext=(x + (-1 if key == "half" else 1) * 3, y + dy),
+                    ha="right" if key == "half" else "left", fontsize=10, color=INK,
+                    bbox=dict(fc=SURFACE, ec="none", alpha=0.9, pad=1.5))
+    ax.set_xlabel("기온이 10도 아래로 내려간 날로부터 (일)")
+    ax.set_ylabel("그해 정점 대비 검색량")
+    ax.set_ylim(0, 1.18)
+    ax.set_xlim(es.index.min(), es.index.max())
+    ax.legend(loc="upper left", fontsize=9, frameon=False)
+    headline(fig, f"Q6. 패딩 검색은 기온이 10도 아래로 내려가기 {abs(marks['half'])}일 전에 이미 정점의 절반, 내려간 뒤 {marks['p80']}일이면 80%예요",
+             "회색 선 = 해마다(9개) 한 줄, 파란 굵은 선 = 평균. 모든 해를 '기온이 10도 아래로 처음 내려간 날'에 맞춰 겹쳤어요.\n"
+             "세로축은 그해 정점을 1로 본 검색량이에요. 선이 0일 전에 이미 올라 있으면 '10도에 닿기 전부터 슬슬 찾기 시작한다'는 뜻이에요.\n"
+             "해마다 정점일은 닿은 날 + 평균 9일(편차 ±8일)이라 평균 선은 완만한 언덕처럼 보여요. 붐비는 시기는 '닿은 날 전후 며칠~2주'로 읽는 게 안전해요.")
+    fig.tight_layout(rect=[0, 0, 1, 0.86])
+    save(fig, "08_padding_event_study.png")
+
+
+def fig_forecast(d, scen, fc):
+    """Q6 결과 그래프: 과거 9년의 '닿은 날 -> 정점일'과 올해 시나리오"""
+    fig, ax = plt.subplots(figsize=(11, 7.8))
+    col = COLORS["패딩"]
+    d = d.sort_values("year").reset_index(drop=True)
+    rows = [(f"'{str(int(r['year']))[2:]}", r["trigger_doy"], r["peak_doy"], False, 0) for _, r in d.iterrows()]
+    rows += [(label, t, p, True, band) for label, t, p, band in scen]
+    for i, (label, t, p, fut, band) in enumerate(rows):
+        if fut:
+            ax.plot([t, p], [i, i], color=col, lw=2, alpha=0.5, zorder=2)
+            if band:
+                ax.barh(i, 2 * band, left=p - band, height=0.5, color=col, alpha=0.15, zorder=1)
+        else:
+            ax.plot([t, p], [i, i], color=INK_2, lw=1.8, alpha=0.5, zorder=2)
+        ax.scatter([t], [i], s=75, facecolor=SURFACE, edgecolor=col if fut else INK_2, linewidth=1.8, zorder=3)
+        ax.scatter([p], [i], s=75, color=col, alpha=1 if not fut else 0.6, edgecolor=SURFACE, linewidth=1.2, zorder=4)
+    ax.set_yticks(range(len(rows)))
+    ax.set_yticklabels([r[0] for r in rows], fontsize=10)
+    ax.set_ylim(len(rows) - 0.4, -0.8)
+    ax.axhline(len(d) - 0.5, color=GRID, lw=1)
+    today = doy(fc["today"])
+    ax.axvline(today, color=INK, lw=1.2, ls=(0, (4, 3)))
+    ax.text(today + 0.8, len(rows) - 0.6, f"데이터 마지막 날 ({fc['today']:%m-%d})", fontsize=9.5, va="bottom")
+    ax.set_xlim(285, 350)
+    date_axis(ax, "x")
+    ax.scatter([], [], s=75, facecolor=SURFACE, edgecolor=INK_2, linewidth=1.8, label="기온이 10도 아래로 처음 내려간 날")
+    ax.scatter([], [], s=75, color=col, label="검색이 가장 많았던 날(올해는 예상)")
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.06), ncol=2, fontsize=9.5, frameon=False)
+    if fc["cond"]:
+        title = (f"Q6. 올해는 요즘 기온이 과거 9년보다 높아서, 패딩이 가장 붐비는 때는 평년({fc['mid_peak']})보다 늦은 {fc['cond_peak']} 전후로 예상돼요")
+        tip = (f"위 9줄 = 과거 기록, 아래 4줄 = 올해 예상이에요. 마지막 줄은 '요즘 기온이 높은 해일수록 10도에 늦게 닿았다'는 관계(r={fc['cond']['r']:.2f})로 계산했어요.\n"
+               f"앞의 3줄은 오늘 기온을 안 쓰고 과거 9년 중 가장 이른 날·가운데·가장 늦은 날로 가정한 경우예요. 정점 예상 = 닿은 날 + 평균 {fc['mean_lag']:.0f}일, 연한 띠 = 예상이 빗나갈 수 있는 폭이에요.\n"
+               f"올해 최근 7일 평균기온은 {fc['cond']['xnow']:.1f}도로 과거 9년 같은 날(평균 {fc['cond']['xmean']:.1f}도)보다 높고, 과거 최고({fc['cond']['xmax']:.1f}도)와 비슷하거나 넘어서 신뢰는 낮은 편이에요.")
+    else:
+        title = "Q6. 올해는 기온이 10도에 닿은 날 + 평균 9일이 패딩이 가장 붐비는 때예요"
+        tip = "위 9줄 = 과거 기록, 아래 줄 = 올해예요. 연한 띠 = 예상이 빗나갈 수 있는 폭이에요."
+    headline(fig, title, tip)
+    fig.tight_layout(rect=[0, 0, 1, 0.84])
+    save(fig, "09_padding_2026_forecast.png")
+
 
 
 def fig_overview(cleaned, sm):
@@ -803,6 +893,87 @@ def main():
         s = seasons[col]
         say(f"    {col}: {trend_per_year(s):+.1f}일/년 (n={int(s.notna().sum())})")
 
+    # ---- Q6
+    say("")
+    say("=" * 70)
+    say("Q6. 올해 패딩은 언제 몰릴까? (패딩만 날씨와 연동된다는 결과를 올해에 적용)")
+    say("=" * 70)
+    _, dpad = best_detail["패딩"]
+    info_pad = best_detail["패딩"][0]
+    thr_pad = int(bests["패딩"])
+    lag_pad = float(info_pad["mean_lag"])
+    mae_pad = float(robust["패딩"]["nested_wx"])
+    sm7p = smooth(cleaned, SMOOTH_DAYS)
+    es = padding_event_study(sm7p, dpad)
+    mean_curve = es.mean(axis=1)
+    half_x = int(mean_curve[mean_curve >= 0.5].index[0])
+    peak_x = int(mean_curve.idxmax())
+    marks = dict(half=half_x, peak=int(round(lag_pad)))
+    p80_x = int(mean_curve[mean_curve >= 0.8].index[0])
+    marks_data = dict(half=half_x, p80=p80_x)
+    say(f"  기준 기온 {thr_pad}도, 평균 시차 +{lag_pad:.1f}일, 공정한 검증의 평균 오차 ±{mae_pad:.1f}일")
+    say(f"  기온이 기준에 닿은 날을 0으로 맞춘 9년 평균 검색 곡선: 정점의 절반을 넘은 날 {half_x:+d}일, 평균 곡선이 가장 높은 날 {peak_x:+d}일")
+    for lv in (0.3, 0.5, 0.8):
+        say(f"    평균이 정점의 {int(lv * 100)}%를 처음 넘은 날: {int(mean_curve[mean_curve >= lv].index[0]):+d}일")
+    pd.DataFrame({"days_from_trigger": mean_curve.index, "mean_share_of_peak": mean_curve.round(3).values}).to_csv(
+        OUT_DIR / "q6_event_study.csv", index=False, encoding="utf-8-sig")
+
+    cross = dpad.sort_values("year")["trigger_doy"].astype(float)
+    cross_dates = pd.to_datetime(dpad["trigger_date"])
+    now_cross = trigger_date(temp7, last_day.year, thr_pad, "cold", (9, 1))
+    temp_now = float(temp7.dropna().iloc[-1])
+    if pd.isna(now_cross):
+        say(f"  올해는 아직 {thr_pad}도 아래로 내려가지 않았음 -> 시나리오로 예상")
+        scen_def = [("올해 이른 추위 시나리오", cross.min(), 6), ("올해 평년 시나리오", cross.median(), 6), ("올해 늦은 추위 시나리오", cross.max(), 6)]
+    else:
+        say(f"  올해는 {now_cross:%m-%d}에 닿음 -> 실제 도달일로 예상")
+        scen_def = [("올해 실제 도달", float(doy(now_cross)), 6)]
+    cond = None
+    if pd.isna(now_cross):
+        trail = temp.rolling(7).mean()
+        yrs = [int(y) for y in dpad.sort_values("year")["year"]]
+        xs = np.array([trail.loc[pd.Timestamp(y, last_day.month, last_day.day)] for y in yrs], float)
+        cs = dpad.sort_values("year")["trigger_doy"].to_numpy(float)
+        xnow = float(trail.loc[last_day])
+        n6 = len(xs)
+        e_reg, e_mean = [], []
+        for i in range(n6):
+            m = np.arange(n6) != i
+            b_, a_ = np.polyfit(xs[m], cs[m], 1)
+            e_reg.append(abs(cs[i] - (a_ + b_ * xs[i])))
+            e_mean.append(abs(cs[i] - cs[m].mean()))
+        b_all, a_all = np.polyfit(xs, cs, 1)
+        r_all = float(np.corrcoef(xs, cs)[0, 1])
+        rng6 = np.random.default_rng(PERM_SEED)
+        hits6 = sum(abs(np.corrcoef(xs, rng6.permutation(cs))[0, 1]) >= abs(r_all) for _ in range(5000))
+        p6 = (hits6 + 1) / 5001
+        cond_cross = a_all + b_all * xnow
+        cond = dict(cross=cond_cross, e_reg=float(np.mean(e_reg)), e_mean=float(np.mean(e_mean)), r=r_all, p=p6,
+                    slope=float(b_all), xnow=xnow, xmin=float(xs.min()), xmax=float(xs.max()), xmean=float(xs.mean()))
+        say("")
+        say(f"  [오늘 기온을 반영한 예상] {last_day:%m-%d}까지 최근 7일 평균기온이 높은 해일수록 기온이 {thr_pad}도에 늦게 닿았는지 확인")
+        say(f"    과거 9년 같은 날 최근 7일 평균기온: 평균 {cond['xmean']:.1f}도, 범위 {cond['xmin']:.1f}~{cond['xmax']:.1f}도 / 올해 {xnow:.1f}도")
+        say(f"    상관 r={r_all:.2f} (우연일 확률 p={p6:.3f}), 1도 높을수록 {b_all:.1f}일 늦게 닿음")
+        say(f"    한 해씩 빼고 맞힌 평균 오차: 이 방법 {cond['e_reg']:.1f}일 vs 그냥 평균 날짜 {cond['e_mean']:.1f}일")
+        say(f"    올해 예상 도달일 {md_label(cond_cross)} (평년 중앙값 {md_label(cross.median())}보다 {cond_cross - cross.median():+.0f}일)"
+            + (" - 올해 기온이 과거 범위를 벗어나 있어 신뢰가 낮음" if xnow > xs.max() or xnow < xs.min() else ""))
+        band_c = float(np.sqrt(cond["e_reg"] ** 2 + mae_pad ** 2))
+        scen_def.append(("올해 예상\n(오늘 기온 반영)", cond_cross, band_c))
+    scen, rows6 = [], []
+    for label, t, _ in scen_def:
+        p = t + lag_pad
+        bnd = _ if _ != 6 else mae_pad
+        scen.append((label, t, p, bnd))
+        rows6.append(dict(scenario=label.replace("\n", " "), cross_date=md_label(t), expected_peak=md_label(p),
+                          expected_range=f"{md_label(p - bnd)}~{md_label(p + bnd)}"))
+        say(f"    {label.replace(chr(10), ' ')}: 기온 도달 {md_label(t)} -> 정점 예상 {md_label(p)} (보통 {md_label(p - bnd)}~{md_label(p + bnd)} 안팎)")
+    pd.DataFrame(rows6).to_csv(OUT_DIR / "q6_padding_forecast.csv", index=False, encoding="utf-8-sig")
+    say(f"  (참고: 과거 9년 정점일 중앙값은 {md_label(peaks[peaks.event == '패딩']['peak_doy'].median())}. 예측의 평균 오차 ±{mae_pad:.1f}일은 공정한 검증 기준)")
+    say("  (이 예측은 검색 관심이 몰리는 시기이며, 가격·재고는 보지 않았음)")
+    fc = dict(today=last_day, temp_now=temp_now, mean_lag=lag_pad, mae=mae_pad,
+              mid_cross=md_label(cross.median()), mid_peak=md_label(cross.median() + lag_pad), cond=cond,
+              cond_peak=md_label(cond["cross"] + lag_pad) if cond else None)
+
     # ---- 변화율
     say("")
     say("=" * 70)
@@ -827,6 +998,8 @@ def main():
     fig_year_by_year(best_detail, bests)
     fig_sweep(sweeps, tstar, bests)
     fig_seasons(seasons)
+    fig_event_study(es, marks_data)
+    fig_forecast(dpad, scen, fc)
 
     (OUT_DIR / "summary.txt").write_text("\n".join(LOG_LINES) + "\n", encoding="utf-8")
     print("\n끝났어요. images/ 폴더의 그래프와 outputs/summary.txt 를 확인하세요.")
